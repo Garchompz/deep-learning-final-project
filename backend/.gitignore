@@ -1,0 +1,9 @@
+# Python virtual environment
+venv/
+__pycache__/
+*.pyc
+node_modules/
+.env
+# OS & editor
+.DS_Store
+.vscode/
