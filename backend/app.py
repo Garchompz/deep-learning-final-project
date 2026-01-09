@@ -4,242 +4,135 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 from tensorflow.keras.preprocessing.sequence import pad_sequences
-from tensorflow.keras.applications import EfficientNetB2
-from tensorflow.keras.applications.efficientnet import preprocess_input
+# Updated to match training: EfficientNetV2B0
+from tensorflow.keras.applications import EfficientNetV2B0
+from tensorflow.keras.applications.efficientnet_v2 import preprocess_input
 import numpy as np
 from PIL import Image
 import io
 import base64
 import pickle
-
-# Register custom layers
-register_keras_serializable = keras.utils.register_keras_serializable
+import os
 
 app = Flask(__name__)
 CORS(app)
 
 # ======================================================
-# CONSTANTS
+# CONSTANTS (Synchronized with Training)
 # ======================================================
-IMAGE_SIZE = (260, 260)
-MAX_LEN = 40
-EMBEDDING_DIM = 256
-UNITS = 256
+IMAGE_SIZE = (224, 224) # Training used 224 for EffNetV2B0
+MAX_LEN = 35           # Training calculated max_length from Flickr8k
+EMBEDDING_DIM = 512
+LSTM_UNITS = 512       # Training used 512 units
 
 # ======================================================
-# CUSTOM LAYER: BAHDANAU ATTENTION (FIXED)
+# CUSTOM LAYER: BAHDANAU ATTENTION
 # ======================================================
-@register_keras_serializable(package="Custom", name="BahdanauAttention")
+@keras.utils.register_keras_serializable(package="Custom")
 class BahdanauAttention(tf.keras.layers.Layer):
     def __init__(self, units, **kwargs):
-        super(BahdanauAttention, self).__init__(**kwargs)
+        super().__init__(**kwargs)
         self.units = units
-        self.W1 = layers.Dense(units)
-        self.W2 = layers.Dense(units)
-        self.V = layers.Dense(1)
+        self.W1 = layers.Dense(units, use_bias=False)
+        self.W2 = layers.Dense(units, use_bias=False)
+        self.V = layers.Dense(1, use_bias=False)
 
-    def build(self, input_shape):
-        # Explicit build method to satisfy Keras loading mechanism
-        # input_shape is usually a list of shapes [features_shape, hidden_shape]
-        super(BahdanauAttention, self).build(input_shape)
-
-    def call(self, inputs, hidden=None):
-        # === FIX LOGIC FOR KERAS DESERIALIZATION ===
-        # Keras sering mengirim inputs sebagai list [features, hidden] ke argumen pertama
-        if hidden is None:
-            features, hidden = inputs
-        else:
-            features = inputs
-        # ===========================================
-
-        # hidden_with_time_axis shape == (batch_size, 1, hidden_size)
-        hidden_with_time_axis = tf.expand_dims(hidden, 1)
-
-        # attention_weights shape == (batch_size, 64, 1)
-        score = tf.nn.tanh(self.W1(features) + self.W2(hidden_with_time_axis))
+    def call(self, inputs):
+        # Training logic: context_vector, att_weights = attention([encoder_input, lstm_out])
+        encoder_features, decoder_hidden = inputs
+        decoder_hidden = tf.expand_dims(decoder_hidden, 1)
+        score = tf.nn.tanh(self.W1(encoder_features) + self.W2(decoder_hidden))
         attention_weights = tf.nn.softmax(self.V(score), axis=1)
-
-        # context_vector shape after sum == (batch_size, hidden_size)
-        context_vector = attention_weights * features
-        context_vector = tf.reduce_sum(context_vector, axis=1)
-
-        return context_vector, attention_weights
+        context_vector = tf.reduce_sum(attention_weights * encoder_features, axis=1)
+        return context_vector, tf.squeeze(attention_weights, -1)
 
     def get_config(self):
         config = super().get_config()
         config.update({"units": self.units})
         return config
-    
-@tf.keras.utils.register_keras_serializable(package="Custom")
-class TransformerDecoderLayer(tf.keras.layers.Layer):
-    def __init__(self, d_model, num_heads, ff_dim, dropout=0.1, **kwargs):
-        super().__init__(**kwargs)
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.ff_dim = ff_dim
-        self.dropout = dropout
 
 # ======================================================
-# MANUAL MODEL RECONSTRUCTION (BACKUP PLAN)
+# MODEL RECONSTRUCTION
 # ======================================================
 def reconstruct_caption_model(vocab_size):
-    """
-    Membangun ulang arsitektur model secara manual agar 100% cocok dengan notebook.
-    Ini digunakan jika load_model gagal melakukan deserialization layer custom.
-    """
-    print("🔨 Reconstructing model architecture manually...")
+    print("🔨 Reconstructing model architecture to match training...")
     
-    # Encoder Input
-    # Shape dari EffNetB2 (260x260) -> output map 8x8 (approx) -> 64 patches
-    # Channel EffNetB2 = 1408
-    # Kita gunakan None untuk num_patches agar fleksibel
-    encoder_input = layers.Input(shape=(None, 1408), name='image_features')
-    
-    # Decoder Input
+    # Encoder Output Shape for EffNetV2B0 is typically (batch, 7, 7, 1280) -> 49 patches
+    encoder_input = layers.Input(shape=(49, 1280), name='image_features')
     decoder_input = layers.Input(shape=(MAX_LEN,), name='decoder_input')
     
-    # Embedding
-    embed = layers.Embedding(
-        input_dim=vocab_size,
-        output_dim=EMBEDDING_DIM,
-        mask_zero=True,
-        name='embed'
-    )(decoder_input)
+    # Embedding (Matches Training)
+    embed = layers.Embedding(input_dim=vocab_size, output_dim=512, mask_zero=True, name='embed')(decoder_input)
+    embed = layers.Dropout(0.3)(embed)
     
-    # LSTM 1
-    bilstm_1 = layers.Bidirectional(
-        layers.LSTM(UNITS, return_sequences=True, dropout=0.3, recurrent_dropout=0.3),
-        name='bilstm_1'
-    )(embed)
-    
-    # LSTM 2
-    bilstm_2 = layers.Bidirectional(
-        layers.LSTM(UNITS, return_sequences=False, dropout=0.3, recurrent_dropout=0.3),
-        name='bilstm_2'
-    )(bilstm_1)
+    # Single LSTM (Training did NOT use Bidirectional)
+    lstm_out = layers.LSTM(LSTM_UNITS, return_sequences=False, dropout=0.3, recurrent_dropout=0.2, name='lstm')(embed)
+    lstm_out = layers.LayerNormalization()(lstm_out)
     
     # Attention
-    attention_layer = BahdanauAttention(UNITS)
-    # Ini cara panggil di training: attention(encoder_input, bilstm_2)
-    context_vector, att_weights = attention_layer([encoder_input, bilstm_2])
+    attention_layer = BahdanauAttention(512)
+    context_vector, _ = attention_layer([encoder_input, lstm_out])
     
-    # Concatenate
-    concat = layers.Concatenate(axis=-1)([context_vector, bilstm_2])
-    
-    # Dense Layers
-    x = layers.Dense(256, activation='relu')(concat)
-    x = layers.Dropout(0.5)(x)
-    x = layers.Dense(128, activation='relu')(x)
+    # Head (Matches Training logic)
+    concat = layers.Concatenate(axis=-1)([context_vector, lstm_out])
+    x = layers.Dense(512, activation='relu')(concat)
+    x = layers.Dropout(0.4)(x)
+    x = layers.LayerNormalization()(x)
+    x = layers.Dense(256, activation='relu')(x)
     x = layers.Dropout(0.3)(x)
     
-    # Output
     outputs = layers.Dense(vocab_size, activation='softmax', name='output')(x)
     
-    model = keras.Model(inputs=[encoder_input, decoder_input], outputs=outputs)
-    return model
+    return keras.Model(inputs=[encoder_input, decoder_input], outputs=outputs)
 
 # ======================================================
-# 1. LOAD TOKENIZER FIRST (Need vocab size for model)
+# INITIALIZATION
 # ======================================================
-import os
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKENIZER_PATH = os.path.join(BASE_DIR, "tokenizer1.pkl")
+MODEL_PATH = os.path.join(BASE_DIR, "caption_model_effnetv2b0.keras")
+
+# Load Tokenizer
+with open(TOKENIZER_PATH, 'rb') as f:
+    tokenizer = pickle.load(f)
+WORD_INDEX = tokenizer.word_index
+INDEX_WORD = tokenizer.index_word
+VOCAB_SIZE = len(WORD_INDEX) + 1
+
+# Load Model
 try:
-    TOKENIZER_PATH = os.path.join(BASE_DIR, "tokenizer.pkl")
-    with open(TOKENIZER_PATH, 'rb') as f:
-        tokenizer = pickle.load(f)
-    
-    if hasattr(tokenizer, 'index_word'):
-        INDEX_WORD = tokenizer.index_word
-        WORD_INDEX = tokenizer.word_index
-    else:
-        INDEX_WORD = tokenizer['index_word']
-        WORD_INDEX = tokenizer['word_index']
-        
-    VOCAB_SIZE = len(WORD_INDEX) + 1
-    print(f"✅ Tokenizer loaded. Vocab size: {VOCAB_SIZE}")
-    
+    # Attempting reconstruction first to avoid naming/versioning conflicts
+    model = reconstruct_caption_model(VOCAB_SIZE)
+    model.load_weights(MODEL_PATH)
+    print("✅ Model weights loaded successfully!")
 except Exception as e:
-    print(f"⚠️ Tokenizer loading failed: {e}")
-    # Fallback default untuk mencegah crash sebelum load model
-    VOCAB_SIZE = 15000 
-    INDEX_WORD = {}
-    WORD_INDEX = {}
+    print(f"❌ Critical Load Error: {e}")
+    # Final fallback attempt
+    model = keras.models.load_model(MODEL_PATH, custom_objects={'BahdanauAttention': BahdanauAttention}, compile=False)
+
+# Load Encoder (EfficientNetV2B0)
+print("🏗️ Initializing EfficientNetV2B0 Encoder...")
+base_fe = EfficientNetV2B0(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+encoder_model = keras.Model(inputs=base_fe.input, outputs=base_fe.output)
 
 # ======================================================
-# 2. LOAD MODEL (With Fail-Safe Strategy)
+# INFERENCE HELPERS
 # ======================================================
-
-custom_objects = {'BahdanauAttention': BahdanauAttention, "TransformerDecoderLayer": TransformerDecoderLayer}
-model = None
-MODEL_PATH = os.path.join(BASE_DIR, "caption_trained_model_effb2.keras")
-
-print("=" * 60)
-print("🔄 Attempting to load Model...")
-
-# CARA 1: Load Full Model (Preferred)
-try:
-    model = keras.models.load_model(
-        MODEL_PATH,
-        custom_objects=custom_objects,
-        compile=False
-    )
-    print("✅ Model loaded successfully via load_model!")
-
-except Exception as e:
-    print(f"⚠️ load_model failed: {e}")
-    print("🔄 Switching to Strategy 2: Reconstruct Architecture + Load Weights")
-    
-    # CARA 2: Reconstruct + Load Weights (Fail-Safe)
-    try:
-        model = reconstruct_caption_model(VOCAB_SIZE)
-        # Load weights only
-        model.load_weights(MODEL_PATH)
-        print("✅ Model reconstructed and weights loaded successfully!")
-    except Exception as e2:
-        print(f"❌ CRITICAL: Could not load model even after reconstruction: {e2}")
-        raise e2
-
-# ======================================================
-# 3. LOAD ENCODER (EfficientNetB2)
-# ======================================================
-
-print("🏗️ Initializing EfficientNetB2 Encoder...")
-encoder_base = EfficientNetB2(
-    include_top=False, 
-    weights='imagenet', 
-    input_shape=(IMAGE_SIZE[0], IMAGE_SIZE[1], 3)
-)
-encoder_model = keras.Model(inputs=encoder_base.input, outputs=encoder_base.output)
-print("✅ Encoder initialized")
-
-# ======================================================
-# HELPER FUNCTIONS
-# ======================================================
-
 def preprocess_image(img_bytes):
     img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-    img = img.resize(IMAGE_SIZE, Image.BILINEAR)
+    img = img.resize(IMAGE_SIZE, Image.LANCZOS)
     img_array = np.array(img)
     img_array = np.expand_dims(img_array, axis=0) 
-    img_array = preprocess_input(img_array)
-    return img_array
+    return preprocess_input(img_array) # EffNetV2 preprocessing
 
 def extract_features(img_array):
-    features = encoder_model.predict(img_array, verbose=0)
-    batch, h, w, c = features.shape
-    # Reshape (Batch, 8*8, 1408) -> (Batch, 64, 1408)
-    features_reshaped = features.reshape(batch, h * w, c) 
-    return features_reshaped
+    feat_map = encoder_model.predict(img_array, verbose=0)[0]
+    h, w, c = feat_map.shape
+    return feat_map.reshape(1, h * w, c) # Returns (1, 49, 1280)
 
-def clean_caption(caption):
-    caption = caption.replace('startseq', '').replace('endseq', '').strip()
-    return caption.capitalize()
-
-def generate_caption_beam(feature_vector, beam_index=3):
+def generate_caption(feature_vector, beam_index=5):
     start_seq = WORD_INDEX.get('startseq')
     end_seq = WORD_INDEX.get('endseq')
-    
-    if not start_seq: return "Error: Tokenizer missing 'startseq'"
     
     sequences = [[[start_seq], 0.0]]
     
@@ -250,65 +143,40 @@ def generate_caption_beam(feature_vector, beam_index=3):
                 all_candidates.append([seq, score])
                 continue
             
-            seq_pad = pad_sequences([seq], maxlen=MAX_LEN, padding='post')
+            padded = pad_sequences([seq], maxlen=MAX_LEN, padding='post')
+            preds = model.predict([feature_vector, padded], verbose=0)[0]
             
-            # Predict
-            # INPUT: [image_features, decoder_sequence]
-            yhat = model.predict([feature_vector, seq_pad], verbose=0)
-            probs = yhat[0]
-            
-            top_indices = np.argsort(probs)[-beam_index:]
-            
-            for word_idx in top_indices:
-                p = probs[word_idx]
-                if p <= 1e-9: continue
-                new_score = score + np.log(p)
-                new_seq = seq + [int(word_idx)]
-                all_candidates.append([new_seq, new_score])
+            top_indices = np.argsort(preds)[-beam_index:]
+            for idx in top_indices:
+                all_candidates.append([seq + [int(idx)], score - np.log(preds[idx] + 1e-10)])
         
-        ordered = sorted(all_candidates, key=lambda x: x[1], reverse=True)
+        ordered = sorted(all_candidates, key=lambda x: x[1])
         sequences = ordered[:beam_index]
-        
-        if sequences[0][0][-1] == end_seq and len(sequences[0][0]) > 1:
-            break
+        if all(s[0][-1] == end_seq for s in sequences): break
 
     best_seq = sequences[0][0]
-    final_caption = [INDEX_WORD.get(idx) for idx in best_seq if idx not in [start_seq, end_seq] and INDEX_WORD.get(idx)]
-    return clean_caption(" ".join(final_caption))
+    words = [INDEX_WORD.get(i) for i in best_seq if i not in [start_seq, end_seq]]
+    return " ".join(filter(None, words)).capitalize() + "."
 
 # ======================================================
 # ROUTES
 # ======================================================
-
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
-        img_bytes = None
-        if request.content_type and 'application/json' in request.content_type:
-            data = request.get_json(force=True)
-            img_b64 = data.get('image') or data.get('data')
-            if not img_b64: return jsonify({'error': 'No image data'}), 400
-            if ',' in img_b64: img_b64 = img_b64.split(',', 1)[1]
-            img_bytes = base64.b64decode(img_b64)
-        elif 'file' in request.files:
-            img_bytes = request.files['file'].read()
+        if 'file' in request.files:
+            file = request.files['file'].read()
         else:
-            return jsonify({'error': 'No file uploaded'}), 400
+            data = request.get_json()
+            file = base64.b64decode(data['image'].split(',')[-1])
 
-        img_array = preprocess_image(img_bytes)
-        features = extract_features(img_array)
-        caption = generate_caption_beam(features)
-
+        processed_img = preprocess_image(file)
+        features = extract_features(processed_img)
+        caption = generate_caption(features)
+        
         return jsonify({'caption': caption})
-
     except Exception as e:
-        print(f"Error: {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    return jsonify({'status': 'healthy', 'model_loaded': model is not None})
-
 if __name__ == "__main__":
-    print("\n🚀 Starting Flask Server...")
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=False, host='0.0.0.0', port=5000)
