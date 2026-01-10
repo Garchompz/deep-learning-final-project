@@ -161,6 +161,9 @@ def generate_caption(feature_vector, beam_index=5):
 # ======================================================
 # ROUTES
 # ======================================================
+@app.route('/')
+def index():
+    return jsonify({"status": "online", "message": "Captioning Model API is running"})
 @app.route('/predict', methods=['POST'])
 def predict():
     try:

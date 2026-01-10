@@ -201,6 +201,8 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+docker-compose.yml
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
