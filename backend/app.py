@@ -89,8 +89,9 @@ def reconstruct_caption_model(vocab_size):
 # INITIALIZATION
 # ======================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TOKENIZER_PATH = os.path.join(BASE_DIR, "tokenizer.pkl")
-MODEL_PATH = os.path.join(BASE_DIR, "caption_model_effnetv2b0.keras")
+PREV_DIR = os.path.dirname(BASE_DIR)
+TOKENIZER_PATH = os.path.join(PREV_DIR, "tokenizer.pkl")
+MODEL_PATH = os.path.join(PREV_DIR, "caption_model_effnetv2b0.keras")
 
 # Load Tokenizer
 with open(TOKENIZER_PATH, 'rb') as f:
