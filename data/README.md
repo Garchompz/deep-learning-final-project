@@ -7,4 +7,4 @@ A new benchmark collection for sentence-based image description and search, cons
 ## Source
 Dataset source: https://www.kaggle.com/datasets/adityajn105/flickr8k
 ## Processed Dataset
-Processed dataset is in the form of features extracted from the feature extractor model, however the file size is large so is not included in this repo, but may be generated through the experiment notebooks in this repo.
+Processed dataset is in the form of features extracted from the feature extractor model, however the file size is large so it is not included in this repo, but may be generated through the experiment notebooks in this repo.
